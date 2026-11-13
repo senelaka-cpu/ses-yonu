@@ -1,0 +1,319 @@
+name: APK derle
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Proje dosyalarini olustur
+        run: |
+          mkdir -p src/main/java/app/sesyonu
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "SesYonu"
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2"
+              id("org.jetbrains.kotlin.android") version "1.9.24"
+          }
+          android {
+              namespace = "app.sesyonu"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "app.sesyonu"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          cat > src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <application android:label="Ses Yönü" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true" android:screenOrientation="landscape">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          cat > src/main/java/app/sesyonu/MainActivity.kt <<'EOF_FILE'
+          package app.sesyonu
+          
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.graphics.Canvas
+          import android.graphics.Paint
+          import android.media.AudioFormat
+          import android.media.AudioRecord
+          import android.media.MediaRecorder
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import kotlin.math.*
+          
+          class MainActivity : Activity() {
+              private lateinit var gauge: Gauge
+              private lateinit var status: TextView
+              private lateinit var btnSrc: Button
+              private var worker: Thread? = null
+              @Volatile private var running = false
+              @Volatile private var flip = false
+              @Volatile private var dist = 0.15
+              private var srcIdx = 0
+              private val sources = intArrayOf(
+                  MediaRecorder.AudioSource.CAMCORDER,
+                  MediaRecorder.AudioSource.UNPROCESSED,
+                  MediaRecorder.AudioSource.MIC,
+                  MediaRecorder.AudioSource.VOICE_RECOGNITION
+              )
+              private val names = arrayOf("CAMCORDER", "UNPROCESSED", "MIC", "VOICE_RECOGNITION")
+          
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(0xFF101216.toInt())
+                  root.setPadding(24, 12, 24, 12)
+                  status = TextView(this)
+                  status.setTextColor(0xFFCCCCCC.toInt())
+                  status.textSize = 12f
+                  status.text = "Hazır"
+                  gauge = Gauge(this)
+                  root.addView(status)
+                  root.addView(gauge, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  row.gravity = Gravity.CENTER_VERTICAL
+                  btnSrc = Button(this)
+                  btnSrc.text = "Kaynak: " + names[0]
+                  btnSrc.setOnClickListener {
+                      srcIdx = (srcIdx + 1) % sources.size
+                      btnSrc.text = "Kaynak: " + names[srcIdx]
+                      start()
+                  }
+                  val btnSwap = Button(this)
+                  btnSwap.text = "Sol/Sağ"
+                  btnSwap.setOnClickListener { flip = !flip }
+                  val lbl = TextView(this)
+                  lbl.setTextColor(0xFFCCCCCC.toInt())
+                  lbl.text = " 15 cm "
+                  val sb = SeekBar(this)
+                  sb.max = 24
+                  sb.progress = 14
+                  sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                          val cm = 8 + p * 0.5
+                          dist = cm / 100.0
+                          lbl.text = " " + cm.toString() + " cm "
+                      }
+                      override fun onStartTrackingTouch(s: SeekBar?) {}
+                      override fun onStopTrackingTouch(s: SeekBar?) {}
+                  })
+                  row.addView(btnSrc)
+                  row.addView(btnSwap)
+                  row.addView(lbl)
+                  row.addView(sb, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  root.addView(row)
+                  setContentView(root)
+                  if (!granted()) requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+              }
+          
+              private fun granted() = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+          
+              override fun onResume() { super.onResume(); if (granted()) start() }
+              override fun onPause() { super.onPause(); stop() }
+              override fun onRequestPermissionsResult(rc: Int, p: Array<out String>, r: IntArray) {
+                  super.onRequestPermissionsResult(rc, p, r)
+                  if (granted()) start() else status.text = "Mikrofon izni verilmedi"
+              }
+          
+              private fun start() {
+                  stop()
+                  running = true
+                  val idx = srcIdx
+                  worker = Thread { record(idx) }.also { it.start() }
+              }
+          
+              private fun stop() {
+                  running = false
+                  worker?.join(1000)
+                  worker = null
+              }
+          
+              private fun ui(s: String) { runOnUiThread { status.text = s } }
+          
+              private fun micInfo(rec: AudioRecord): String {
+                  if (Build.VERSION.SDK_INT < 29) return "mikrofon bilgisi yok (Android < 10)"
+                  return try {
+                      val l = rec.activeMicrophones
+                      if (l.isEmpty()) "aktif mikrofon bilgisi boş"
+                      else l.size.toString() + " mik: " + l.joinToString("; ") { m ->
+                          m.description + " (" + m.position.x + "," + m.position.y + "," + m.position.z + ")"
+                      }
+                  } catch (e: Exception) { "mikrofon bilgisi alınamadı" }
+              }
+          
+              private fun record(idx: Int) {
+                  val fs = 48000
+                  val n = 4096
+                  val cfg = AudioFormat.CHANNEL_IN_STEREO
+                  val enc = AudioFormat.ENCODING_PCM_16BIT
+                  val minBuf = AudioRecord.getMinBufferSize(fs, cfg, enc)
+                  val rec: AudioRecord
+                  try {
+                      rec = AudioRecord(sources[idx], fs, cfg, enc, max(minBuf, n * 8))
+                  } catch (e: Exception) { ui("Kaynak açılamadı: " + names[idx]); return }
+                  if (rec.state != AudioRecord.STATE_INITIALIZED) {
+                      ui("Kaynak başlatılamadı: " + names[idx]); rec.release(); return
+                  }
+                  rec.startRecording()
+                  val buf = ShortArray(n * 2)
+                  val L = FloatArray(n); val R = FloatArray(n)
+                  val a = FloatArray(n); val b = FloatArray(n)
+                  var target = 0.0
+                  var level = 0f
+                  var dc = 0
+                  var info = ""
+                  while (running) {
+                      val r = rec.read(buf, 0, buf.size)
+                      if (r < 8) continue
+                      val m = r / 2
+                      for (i in 0 until m) {
+                          val l = buf[2 * i] / 32768f
+                          val rr = buf[2 * i + 1] / 32768f
+                          if (flip) { L[i] = rr; R[i] = l } else { L[i] = l; R[i] = rr }
+                      }
+                      var eL = 0.0; var eR = 0.0; var eD = 0.0
+                      a[0] = 0f; b[0] = 0f
+                      for (i in 1 until m) {
+                          a[i] = L[i] - L[i - 1]
+                          b[i] = R[i] - R[i - 1]
+                          eL += a[i] * a[i]; eR += b[i] * b[i]
+                          val dd = a[i] - b[i]; eD += dd * dd
+                      }
+                      dc++
+                      if (dc == 12) info = micInfo(rec)
+                      val rms = sqrt((eL + eR) / (2.0 * m))
+                      level = max(level * 0.8f, min(1f, (rms * 40).toFloat()))
+                      val rl = sqrt(eL / m); val rrms = sqrt(eR / m)
+                      var note = "STEREO ✓"
+                      var usable = true
+                      if (eD < (eL + eR) * 1e-6) { note = "MONO (iki kanal aynı) – yön bulunamaz"; usable = false }
+                      else if (min(rl, rrms) < 0.05 * max(rl, rrms)) { note = "bir kanal sessiz – yön bulunamaz"; usable = false }
+                      var conf = 0.0
+                      if (usable && rms > 0.0015) {
+                          val maxLag = min(ceil(dist / 343.0 * fs).toInt() + 2, 60)
+                          val norm = sqrt(eL * eR)
+                          if (norm > 0) {
+                              val cc = DoubleArray(2 * maxLag + 1)
+                              for (lg in -maxLag..maxLag) {
+                                  var s = 0.0
+                                  val i0 = max(1, -lg); val i1 = min(m, m - lg)
+                                  for (i in i0 until i1) s += a[i] * b[i + lg]
+                                  cc[lg + maxLag] = s / norm
+                              }
+                              var k = 0
+                              for (i in 1 until cc.size) if (cc[i] > cc[k]) k = i
+                              var lag = (k - maxLag).toDouble()
+                              if (k > 0 && k < cc.size - 1) {
+                                  val den = cc[k - 1] - 2 * cc[k] + cc[k + 1]
+                                  if (den != 0.0) lag += 0.5 * (cc[k - 1] - cc[k + 1]) / den
+                              }
+                              conf = cc[k]
+                              if (conf >= 0.15) {
+                                  val s = max(-1.0, min(1.0, 343.0 * lag / (fs * dist)))
+                                  val ang = asin(s) * 180.0 / PI
+                                  target += (ang - target) * (min(1.0, conf * 1.5) * 0.5)
+                              }
+                          }
+                      }
+                      val ang = target.toFloat(); val cf = conf.toFloat(); val lv = level
+                      val us = usable
+                      val txt = names[idx] + " | Sol " + String.format("%.1f", rl * 1000) + " · Sağ " +
+                          String.format("%.1f", rrms * 1000) + " | " + note + "\n" + info
+                      runOnUiThread {
+                          gauge.set(ang, cf, lv, us)
+                          if (dc % 3 == 0) status.text = txt
+                      }
+                  }
+                  rec.stop(); rec.release()
+              }
+          
+              inner class Gauge(c: Context) : View(c) {
+                  private var ang = 0f; private var conf = 0f; private var level = 0f; private var ok = true
+                  private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+                  fun set(a: Float, c: Float, l: Float, u: Boolean) { ang = a; conf = c; level = l; ok = u; invalidate() }
+                  override fun onDraw(cv: Canvas) {
+                      val w = width.toDouble(); val h = height.toDouble()
+                      val r = min(w / 2 - 70, h - 130)
+                      val cx = w / 2; val cy = h - 60
+                      p.style = Paint.Style.STROKE; p.strokeWidth = 4f; p.color = 0xFF888888.toInt()
+                      cv.drawArc((cx - r).toFloat(), (cy - r).toFloat(), (cx + r).toFloat(), (cy + r).toFloat(), 180f, 180f, false, p)
+                      p.textAlign = Paint.Align.CENTER
+                      for (d in -90..90 step 30) {
+                          val t = Math.toRadians(d.toDouble())
+                          cv.drawLine((cx - sin(t) * r).toFloat(), (cy - cos(t) * r).toFloat(),
+                              (cx - sin(t) * (r - 20)).toFloat(), (cy - cos(t) * (r - 20)).toFloat(), p)
+                          p.style = Paint.Style.FILL; p.textSize = 26f
+                          cv.drawText(abs(d).toString() + "°", (cx - sin(t) * (r + 30)).toFloat(), (cy - cos(t) * (r + 30)).toFloat() + 8f, p)
+                          p.style = Paint.Style.STROKE
+                      }
+                      p.style = Paint.Style.FILL; p.color = 0xFFEEEEEE.toInt(); p.textSize = 34f
+                      cv.drawText("SOL", (cx - r).toFloat(), (cy + 40).toFloat(), p)
+                      cv.drawText("SAĞ", (cx + r).toFloat(), (cy + 40).toFloat(), p)
+                      cv.drawText("ÖN", cx.toFloat(), (cy - r - 40).toFloat(), p)
+                      val t = Math.toRadians(ang.toDouble())
+                      p.style = Paint.Style.STROKE; p.strokeWidth = 14f; p.strokeCap = Paint.Cap.ROUND
+                      p.color = if (ok) 0xFFE5484D.toInt() else 0xFF666666.toInt()
+                      cv.drawLine(cx.toFloat(), cy.toFloat(), (cx - sin(t) * (r - 10)).toFloat(), (cy - cos(t) * (r - 10)).toFloat(), p)
+                      p.style = Paint.Style.FILL; p.color = 0xFFEEEEEE.toInt()
+                      cv.drawCircle(cx.toFloat(), cy.toFloat(), 14f, p)
+                      p.textSize = 60f
+                      val label = if (!ok) "—" else (if (ang > 1) "Sol " else if (ang < -1) "Sağ " else "Ön ") + abs(ang).roundToInt() + "°"
+                      cv.drawText(label, cx.toFloat(), (cy - r / 3).toFloat(), p)
+                      p.color = 0xFF2F9E6E.toInt()
+                      cv.drawRect((cx - r).toFloat(), (h - 12).toFloat(), (cx - r + 2 * r * level).toFloat(), (h - 4).toFloat(), p)
+                  }
+              }
+          }
+          EOF_FILE
+      - name: Derle
+        run: gradle assembleDebug --no-daemon
+      - name: Yayinla
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Ses Yonu v${{ github.run_number }}
+          files: build/outputs/apk/debug/*.apk
